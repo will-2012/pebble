@@ -7,6 +7,7 @@ package pebble
 import (
 	"io"
 	"os"
+	"sync/atomic"
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
@@ -26,6 +27,10 @@ type checkpointOptions struct {
 
 	// If set, any SSTs that don't overlap with these spans are excluded from a checkpoint.
 	restrictToSpans []CheckpointSpan
+
+	// concurrentLinkOrCopy set concurrent worker to copy or link SST to
+	// speedup checkpoint.
+	concurrentLinkOrCopy uint64
 }
 
 // CheckpointOption set optional parameters used by `DB.Checkpoint`.
@@ -56,6 +61,12 @@ func WithFlushedWAL() CheckpointOption {
 func WithRestrictToSpans(spans []CheckpointSpan) CheckpointOption {
 	return func(opt *checkpointOptions) {
 		opt.restrictToSpans = spans
+	}
+}
+
+func ConcurrentLinkOrCopy(concurrent uint64) CheckpointOption {
+	return func(opt *checkpointOptions) {
+		opt.concurrentLinkOrCopy = concurrent
 	}
 }
 
@@ -151,6 +162,9 @@ func (d *DB) Checkpoint(
 	opt := &checkpointOptions{}
 	for _, fn := range opts {
 		fn(opt)
+	}
+	if opt.concurrentLinkOrCopy == 0 {
+		opt.concurrentLinkOrCopy = 1 // sanitize concurrent option.
 	}
 
 	if _, err := d.opts.FS.Stat(destDir); !oserror.IsNotExist(err) {
@@ -272,7 +286,12 @@ func (d *DB) Checkpoint(
 			return ckErr
 		}
 	}
-
+	// concurrent speedup SST copy or link.
+	var (
+		concurrentCh        = make(chan struct{}, opt.concurrentLinkOrCopy)
+		hasFailedLinkOrCopy atomic.Bool
+	)
+	hasFailedLinkOrCopy.Store(false)
 	var excludedFiles map[deletedFileEntry]*fileMetadata
 	var remoteFiles []base.DiskFileNum
 	// Set of FileBacking.DiskFileNum which will be required by virtual sstables
@@ -316,13 +335,32 @@ func (d *DB) Checkpoint(
 				continue
 			}
 
-			srcPath := base.MakeFilepath(fs, d.dirname, fileTypeTable, fileBacking.DiskFileNum)
-			destPath := fs.PathJoin(destDir, fs.PathBase(srcPath))
-			ckErr = vfs.LinkOrCopy(fs, srcPath, destPath)
-			if ckErr != nil {
-				return ckErr
+			concurrentCh <- struct{}{}
+			go func() {
+				srcPath := base.MakeFilepath(fs, d.dirname, fileTypeTable, fileBacking.DiskFileNum)
+				destPath := fs.PathJoin(destDir, fs.PathBase(srcPath))
+				innerCkErr := vfs.LinkOrCopy(fs, srcPath, destPath)
+				if innerCkErr != nil && !hasFailedLinkOrCopy.Load() {
+					ckErr = innerCkErr
+					hasFailedLinkOrCopy.Store(true)
+				}
+				<-concurrentCh
+			}()
+			if hasFailedLinkOrCopy.Load() {
+				break
 			}
 		}
+		if hasFailedLinkOrCopy.Load() {
+			break
+		}
+	}
+
+	// wait concurrent finish.
+	for i := uint64(0); i < opt.concurrentLinkOrCopy; i++ {
+		concurrentCh <- struct{}{}
+	}
+	if hasFailedLinkOrCopy.Load() {
+		return ckErr
 	}
 
 	var removeBackingTables []base.DiskFileNum
