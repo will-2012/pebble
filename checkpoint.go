@@ -5,9 +5,13 @@
 package pebble
 
 import (
+	"fmt"
 	"io"
 	"os"
+	"regexp"
+	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/cockroachdb/errors/oserror"
 	"github.com/cockroachdb/pebble/internal/base"
@@ -162,6 +166,7 @@ func (d *DB) Checkpoint(
 		opt.concurrentLinkOrCopy = 1 // sanitize concurrent option.
 	}
 
+	step1Start := time.Now()
 	if _, err := d.opts.FS.Stat(destDir); !oserror.IsNotExist(err) {
 		if err == nil {
 			return &os.PathError{
@@ -172,13 +177,17 @@ func (d *DB) Checkpoint(
 		}
 		return err
 	}
+	step1End := time.Now()
 
+	step2Start := time.Now()
 	if opt.flushWAL && !d.opts.DisableWAL {
 		// Write an empty log-data record to flush and sync the WAL.
+
 		if err := d.LogData(nil /* data */, Sync); err != nil {
 			return err
 		}
 	}
+	step2End := time.Now()
 
 	// Disable file deletions.
 	d.mu.Lock()
@@ -188,6 +197,8 @@ func (d *DB) Checkpoint(
 		defer d.mu.Unlock()
 		d.enableFileDeletions()
 	}()
+
+	step3Start := time.Now()
 
 	// TODO(peter): RocksDB provides the option to roll the manifest if the
 	// MANIFEST size is too large. Should we do this too?
@@ -214,6 +225,10 @@ func (d *DB) Checkpoint(
 	d.mu.versions.logUnlock()
 	d.mu.Unlock()
 
+	step3End := time.Now()
+
+	step4Start := time.Now()
+
 	// Wrap the normal filesystem with one which wraps newly created files with
 	// vfs.NewSyncingFile.
 	fs := vfs.NewSyncingFS(d.opts.FS, vfs.SyncingFileOptions{
@@ -237,6 +252,9 @@ func (d *DB) Checkpoint(
 		return ckErr
 	}
 
+	step4End := time.Now()
+
+	step5Start := time.Now()
 	{
 		// Link or copy the OPTIONS.
 		srcPath := base.MakeFilepath(fs, d.dirname, fileTypeOptions, optionsFileNum)
@@ -246,7 +264,9 @@ func (d *DB) Checkpoint(
 			return ckErr
 		}
 	}
+	step5End := time.Now()
 
+	step6Start := time.Now()
 	{
 		// Set the format major version in the destination directory.
 		var versionMarker *atomicfs.Marker
@@ -268,6 +288,9 @@ func (d *DB) Checkpoint(
 			return ckErr
 		}
 	}
+	step6End := time.Now()
+
+	step7Start := time.Now()
 	// concurrent speedup SST copy or link.
 	var (
 		concurrentCh        = make(chan struct{}, opt.concurrentLinkOrCopy)
@@ -329,6 +352,10 @@ func (d *DB) Checkpoint(
 		return ckErr
 	}
 
+	step7End := time.Now()
+
+	step8Start := time.Now()
+
 	var removeBackingTables []base.DiskFileNum
 	for diskFileNum := range virtualBackingFiles {
 		if _, ok := requiredVirtualBackingFiles[diskFileNum]; !ok {
@@ -346,6 +373,9 @@ func (d *DB) Checkpoint(
 		return ckErr
 	}
 
+	step8End := time.Now()
+
+	step9Start := time.Now()
 	// Copy the WAL files. We copy rather than link because WAL file recycling
 	// will cause the WAL files to be reused which would invalidate the
 	// checkpoint.
@@ -362,6 +392,10 @@ func (d *DB) Checkpoint(
 		}
 	}
 
+	step9End := time.Now()
+
+	step10Start := time.Now()
+
 	// Sync and close the checkpoint directory.
 	ckErr = dir.Sync()
 	if ckErr != nil {
@@ -369,6 +403,19 @@ func (d *DB) Checkpoint(
 	}
 	ckErr = dir.Close()
 	dir = nil
+	step10End := time.Now()
+
+	fmt.Printf("Perf checkpoint step1=%s, step2=%s, step3=%s, step4=%s, step5=%s, step6=%s, step7=%s, step8=%s, step9=%s, step10=%s\n",
+		PrettyDuration(step1End.Sub(step1Start)),
+		PrettyDuration(step2End.Sub(step2Start)),
+		PrettyDuration(step3End.Sub(step3Start)),
+		PrettyDuration(step4End.Sub(step4Start)),
+		PrettyDuration(step5End.Sub(step5Start)),
+		PrettyDuration(step6End.Sub(step6Start)),
+		PrettyDuration(step7End.Sub(step7Start)),
+		PrettyDuration(step8End.Sub(step8Start)),
+		PrettyDuration(step9End.Sub(step9Start)),
+		PrettyDuration(step10End.Sub(step10Start)))
 	return ckErr
 }
 
@@ -466,4 +513,20 @@ func (d *DB) writeCheckpointManifest(
 		return err
 	}
 	return manifestMarker.Close()
+}
+
+// PrettyDuration is a pretty printed version of a time.Duration value that cuts
+// the unnecessary precision off from the formatted textual representation.
+type PrettyDuration time.Duration
+
+var prettyDurationRe = regexp.MustCompile(`\.[0-9]{4,}`)
+
+// String implements the Stringer interface, allowing pretty printing of duration
+// values rounded to three decimals.
+func (d PrettyDuration) String() string {
+	label := time.Duration(d).String()
+	if match := prettyDurationRe.FindString(label); len(match) > 4 {
+		label = strings.Replace(label, match, match[:4], 1)
+	}
+	return label
 }
